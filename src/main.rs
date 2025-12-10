@@ -1,4 +1,5 @@
 mod helius;
+mod redis;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -9,7 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=============================================\n");
 
     // Run the WebSocket test
-    helius::extracter::run_websocket_test().await?;
+    helius::ingester::run_websocket_test().await?;
 
     Ok(())
 }

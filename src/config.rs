@@ -3,7 +3,7 @@ use std::env;
 use thiserror::Error;
 
 #[derive(Debug, Default)]
-pub struct IndexerConfig {
+pub struct Config {
     pub api_key: String,
     pub database_url: String,
     pub redis_url: String,
@@ -23,7 +23,7 @@ pub enum ConfigError {
 }
 
 // Environment variable configuration for the indexer
-impl IndexerConfig {
+impl Config {
     pub fn get_config() -> Self {
         let api_key =
             env::var("API_KEY").unwrap_or_else(|_| ConfigError::InvalidAPIKey.to_string());
