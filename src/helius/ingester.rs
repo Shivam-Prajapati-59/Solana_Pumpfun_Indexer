@@ -6,15 +6,42 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::helius::fetcher;
+
 // Configuration
 const MAX_RETRIES: u32 = 5;
 const INITIAL_RETRY_DELAY: u64 = 1000;
 const PING_INTERVAL: u64 = 30000;
+const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
+// ---------------------------------------------------------
+// Local WebSocket Message Structs
+// ---------------------------------------------------------
+#[derive(Debug, serde::Deserialize)]
+struct LogSubscriptionResult {
+    #[serde(rename = "value")]
+    pub value: LogValue,
+    pub context: Option<LogContext>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LogValue {
+    pub signature: String,
+    pub err: Option<Value>,
+    pub logs: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LogContext {
+    pub slot: u64,
+}
+
+// ---------------------------------------------------------
+// The WebSocket Client
+// ---------------------------------------------------------
 #[derive(Debug)]
 pub struct WebSocketClient {
     api_key: String,
-    retry_count: u32,
     subscription_id: Option<u64>,
 }
 
@@ -22,30 +49,26 @@ impl WebSocketClient {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            retry_count: 0,
             subscription_id: None,
         }
     }
 
     pub async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("wss://mainnet.helius-rpc.com/?api-key={}", self.api_key);
-
-        println!("Connecting to WebSocket...");
+        println!("🔌 Connecting to Helius WebSocket...");
 
         let (ws_stream, _) = connect_async(&url).await?;
         let (write, mut read) = ws_stream.split();
-
-        // Wrap write in Arc<Mutex<>> to share between tasks
         let write = Arc::new(Mutex::new(write));
 
-        // Send subscription request for pump.fun program
+        // Send subscription request
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "logsSubscribe",
             "params": [
                 {
-                    "mentions": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
+                    "mentions": [PUMP_FUN_PROGRAM_ID] // Listening to Pump.fun
                 },
                 {
                     "commitment": "confirmed"
@@ -53,20 +76,14 @@ impl WebSocketClient {
             ]
         });
 
-        println!(
-            "Sending subscription request: {}",
-            serde_json::to_string_pretty(&request)?
-        );
-
+        println!("📤 Sending subscription request...");
         write
             .lock()
             .await
-            .send(Message::Text(request.to_string().into())) // <-- Added .into()
+            .send(Message::Text(request.to_string().into()))
             .await?;
 
-        self.retry_count = 0;
-
-        // Start ping task
+        // Start Ping Task (Keep-Alive)
         let write_for_ping = Arc::clone(&write);
         let ping_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(PING_INTERVAL));
@@ -78,39 +95,27 @@ impl WebSocketClient {
                     .await
                     .is_err()
                 {
-                    // <-- Added .into()
-                    eprintln!("Failed to send ping");
                     break;
                 }
-                println!("Ping sent");
             }
         });
 
-        // Handle incoming messages
+        // Listen for Messages
         while let Some(message) = read.next().await {
             match message {
                 Ok(Message::Text(text)) => {
                     if let Err(e) = self.handle_message(&text).await {
-                        eprintln!("Error handling message: {}", e);
+                        eprintln!("⚠️ Message handler error: {}", e);
                     }
                 }
-                Ok(Message::Pong(_)) => {
-                    println!("Pong received");
-                }
-                Ok(Message::Close(_)) => {
-                    println!("WebSocket closed by server");
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("WebSocket error: {}", e);
-                    break;
-                }
+                Ok(Message::Close(_)) => break,
+                Err(_) => break,
                 _ => {}
             }
         }
 
         ping_task.abort();
-        self.reconnect().await
+        Err("WebSocket connection closed".into())
     }
 
     async fn handle_message(
@@ -119,69 +124,75 @@ impl WebSocketClient {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let message: Value = serde_json::from_str(text)?;
 
-        // Handle subscription confirmation
+        // 1. Handle Subscription Confirmation
         if let Some(result) = message.get("result") {
             if let Some(id) = result.as_u64() {
                 self.subscription_id = Some(id);
-                println!("✅ Successfully subscribed with ID: {}", id);
+                println!("✅ Subscribed! Subscription ID: {}", id);
                 return Ok(());
             }
         }
 
-        // Handle actual log data
+        // 2. Handle Log Notifications
         if let Some(params) = message.get("params") {
             if let Some(result) = params.get("result") {
-                println!(
-                    "📥 Received log data: {}",
-                    serde_json::to_string_pretty(result)?
-                );
-
-                // Extract the transaction signature
-                if let Some(signature) = result.get("value").and_then(|v| v.get("signature")) {
-                    if let Some(sig_str) = signature.as_str() {
-                        println!("🔗 Transaction signature: {}", sig_str);
+                if let Ok(log_result) =
+                    serde_json::from_value::<LogSubscriptionResult>(result.clone())
+                {
+                    // Filter: Skip failed transactions
+                    if log_result.value.err.is_some() {
+                        return Ok(());
                     }
+
+                    // Prepare data for the background task
+                    let signature = log_result.value.signature.clone();
+                    let api_key = self.api_key.clone();
+
+                    println!("📥 Detected Tx: {}", signature);
+
+                    // 🔥 CRITICAL: Spawn the background task using your Fetcher
+                    tokio::spawn(async move {
+                        // Call the function from your fetcher.rs file
+                        if let Err(e) =
+                            fetcher::fetch_and_process_transaction(api_key, signature).await
+                        {
+                            eprintln!("❌ Fetcher error: {}", e);
+                        }
+                    });
                 }
             }
-        } else {
-            println!(
-                "📨 Received message: {}",
-                serde_json::to_string_pretty(&message)?
-            );
         }
-
         Ok(())
-    }
-
-    async fn reconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.retry_count >= MAX_RETRIES {
-            eprintln!("Max retry attempts reached. Please check your connection and try again.");
-            return Err("Max retries exceeded".into());
-        }
-
-        let delay = INITIAL_RETRY_DELAY * 2_u64.pow(self.retry_count);
-        println!(
-            "🔄 Attempting to reconnect in {} seconds... (Attempt {}/{})",
-            delay / 1000,
-            self.retry_count + 1,
-            MAX_RETRIES
-        );
-
-        sleep(Duration::from_millis(delay)).await;
-        self.retry_count += 1;
-
-        // Box::pin the recursive call to avoid infinite-sized future
-        Box::pin(self.connect()).await
     }
 }
 
-/// Public function to run the WebSocket test - called from main.rs
+// ---------------------------------------------------------
+// The Runner Loop (Retry Logic)
+// ---------------------------------------------------------
 pub async fn run_websocket_test() -> Result<(), Box<dyn std::error::Error>> {
-    let api_key =
-        std::env::var("HELIUS_API_KEY").expect("HELIUS_API_KEY environment variable must be set");
-
+    let api_key = std::env::var("HELIUS_API_KEY").expect("HELIUS_API_KEY must be set");
     let mut client = WebSocketClient::new(api_key);
-    client.connect().await; // <-- Added ? to propagate error
+    let mut retry_count = 0;
 
-    Ok(())
+    loop {
+        println!("🚀 Starting WebSocket (Attempt {})", retry_count + 1);
+
+        match client.connect().await {
+            Ok(_) => retry_count = 0, // Reset retries on clean exit (rare)
+            Err(e) => {
+                eprintln!("❌ Connection Lost: {}", e);
+                retry_count += 1;
+
+                if retry_count >= MAX_RETRIES {
+                    eprintln!("💀 Max retries reached. Exiting.");
+                    return Err("Max retries exceeded".into());
+                }
+
+                // Exponential Backoff
+                let delay = INITIAL_RETRY_DELAY * 2_u64.pow(retry_count - 1);
+                println!("⏳ Reconnecting in {}s...", delay / 1000);
+                sleep(Duration::from_millis(delay)).await;
+            }
+        }
+    }
 }

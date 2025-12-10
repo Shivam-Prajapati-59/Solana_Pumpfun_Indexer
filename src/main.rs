@@ -1,4 +1,5 @@
 mod helius;
+mod models;
 mod redis;
 
 #[tokio::main]

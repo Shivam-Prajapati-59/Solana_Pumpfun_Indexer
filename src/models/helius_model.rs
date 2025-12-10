@@ -1,15 +1,9 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::prelude::FromRow;
-use sqlx::types::BigDecimal;
+use serde_json::Value;
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct HeliusResponse {
-    pub jsonrpc: String,
-    pub result: Option<TransactionResult>,
-    pub id: Option<String>,
-}
-
+// ------------------------------------------
+// 1. TOP LEVEL RESPONSE
+// ------------------------------------------
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TransactionResult {
     pub slot: u64,
@@ -19,6 +13,9 @@ pub struct TransactionResult {
     pub meta: Option<TransactionMeta>,
 }
 
+// ------------------------------------------
+// 2. TRANSACTION DATA
+// ------------------------------------------
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TransactionData {
     pub signatures: Vec<String>,
@@ -41,14 +38,33 @@ pub struct AccountKey {
     pub writable: bool,
 }
 
+// ------------------------------------------
+// 3. INSTRUCTIONS (The Hard Part)
+// ------------------------------------------
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Instruction {
+    #[serde(rename = "programId")]
+    pub program_id: String,
+    pub accounts: Option<Vec<String>>,
+    pub data: Option<String>,
+    pub parsed: Option<Value>,
+    pub program: Option<String>,
+}
+
+// ------------------------------------------
+// 4. METADATA (Logs & Balances)
+// ------------------------------------------
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TransactionMeta {
-    pub err: Option<serde_json::Value>,
+    pub err: Option<Value>,
     pub fee: u64,
     #[serde(rename = "preBalances")]
     pub pre_balances: Vec<u64>,
     #[serde(rename = "postBalances")]
     pub post_balances: Vec<u64>,
+    #[serde(rename = "computeUnitsConsumed")]
+    pub compute_units_consumed: Option<u64>,
+
     #[serde(rename = "preTokenBalances")]
     pub pre_token_balances: Option<Vec<TokenBalance>>,
     #[serde(rename = "postTokenBalances")]
@@ -59,10 +75,13 @@ pub struct TransactionMeta {
     pub inner_instructions: Option<Vec<InnerInstructionWrapper>>,
 }
 
+// ------------------------------------------
+// 5. HELPER STRUCTS
+// ------------------------------------------
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TokenBalance {
     #[serde(rename = "accountIndex")]
-    pub account_index: usize,
+    pub account_index: u32,
     pub mint: String,
     #[serde(rename = "uiTokenAmount")]
     pub ui_token_amount: UiTokenAmount,
@@ -71,24 +90,12 @@ pub struct TokenBalance {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UiTokenAmount {
-    pub amount: String,
-    pub decimals: u8,
     #[serde(rename = "uiAmount")]
     pub ui_amount: Option<f64>,
+    pub decimals: u8,
+    pub amount: String,
     #[serde(rename = "uiAmountString")]
-    pub ui_amount_string: String,
-}
-
-/// Represents an Instruction which might be Parsed (JSON) or Raw (Base58)
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Instruction {
-    #[serde(rename = "programId")]
-    pub program_id: String,
-    pub accounts: Option<Vec<String>>,
-    pub data: Option<String>, // Base58 data if not parsed
-
-    // Sometimes Helius returns a 'parsed' field if it recognizes the program (e.g. SPL Token)
-    pub parsed: Option<serde_json::Value>,
+    pub ui_amount_string: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

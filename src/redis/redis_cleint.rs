@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client, RedisResult};
-use serde_json::{self, json, value};
-use tracing::{error, info, warn};
+use serde_json::{self};
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct RedisClient {
@@ -22,41 +22,47 @@ impl RedisClient {
         Ok(Self { connection })
     }
 
-    pub async fn publish<T: serde::Serialize>(&mut self, channel: &str, meassage: &T) {
-        let json_message =
-            serde_json::to_string(meassage).context("Failed to Serialize Message into the Json");
+    pub async fn publish<T: serde::Serialize>(&mut self, channel: &str, message: &T) -> Result<()> {
+        let json = serde_json::to_string(message).context("Failed to serialize message")?;
 
         match self
             .connection
-            .publish::<_, _, ()>(channel, json_message.clone().await)
+            .publish::<_, _, ()>(channel, json.clone())
+            .await
         {
             Ok(_) => Ok(()),
             Err(e) => {
-                warn!("Redis Push Error : {}", e);
+                warn!("  Redis publish error: {}", e);
+
                 if e.is_connection_dropped() || e.is_io_error() {
-                    warn!(" Redis connection lost, attempting reconnect...");
+                    warn!("  Redis connection lost, attempting reconnect...");
                 }
+
                 Err(e.into())
             }
         }
     }
 
-    pub async fn set<T: Serialize>(
+    pub async fn set<T: serde::Serialize>(
         &mut self,
         key: &str,
         value: &T,
-        expiry_seconds: Option<u64>,
+        expiry_seconds: Option<usize>,
     ) -> Result<()> {
-        let json = serde_json::to_string(value)?;
+        let json = serde_json::to_string(value).context("Failed to serialize value")?;
 
-        let mut cmd = redis::cmd("SET");
-        cmd.arg(key).arg(json);
-
-        if let Some(ttl) = expiry_seconds {
-            cmd.arg("EX").arg(ttl);
+        if let Some(seconds) = expiry_seconds {
+            self.connection
+                .set_ex::<_, _, ()>(key, json, seconds as u64)
+                .await
+                .context("Failed to set key with expiry")?;
+        } else {
+            self.connection
+                .set::<_, _, ()>(key, json)
+                .await
+                .context("Failed to set key")?;
         }
 
-        cmd.query_async::<(), _>(&mut self.connection).await?;
         Ok(())
     }
 

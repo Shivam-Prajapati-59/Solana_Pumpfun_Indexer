@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
-use sqlx::types::BigDecimal;
 
 // ==========================================
 // 1. DATABASE MODELS (Postgres / TimescaleDB)
@@ -16,12 +15,12 @@ pub struct Token {
     pub uri: String,
     pub bonding_curve_address: String,
     pub creator_wallet: String,
-    pub virtual_token_reserves: BigDecimal,
-    pub virtual_sol_reserves: BigDecimal,
-    pub real_token_reserves: BigDecimal,
-    pub token_total_supply: BigDecimal,
-    pub market_cap_usd: BigDecimal,
-    pub bonding_curve_progress: BigDecimal,
+    pub virtual_token_reserves: u64,
+    pub virtual_sol_reserves: u64,
+    pub real_token_reserves: u64,
+    pub token_total_supply: u64,
+    pub market_cap_usd: u64,
+    pub bonding_curve_progress: u64,
     pub complete: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -32,15 +31,15 @@ pub struct Token {
 pub struct Trade {
     pub signature: String,
     pub token_mint: String,
-    pub sol_amount: BigDecimal,
-    pub token_amount: BigDecimal,
+    pub sol_amount: u64,
+    pub token_amount: u64,
     pub is_buy: bool,
     pub user_wallet: String,
     pub timestamp: DateTime<Utc>,
-    pub virtual_sol_reserves: BigDecimal,
-    pub virtual_token_reserves: BigDecimal,
-    pub price_sol: Option<BigDecimal>,
-    pub price_usd: Option<BigDecimal>,
+    pub virtual_sol_reserves: u64,
+    pub virtual_token_reserves: u64,
+    pub price_sol: Option<u64>,
+    pub price_usd: Option<u64>,
     pub track_volume: bool,
     pub ix_name: String, // 'buy' or 'sell'
     pub slot: i64,       // Used for reorg handling
@@ -51,7 +50,7 @@ pub struct Trade {
 pub struct TokenHolder {
     pub token_mint: String,
     pub user_wallet: String,
-    pub balance: BigDecimal,
+    pub balance: u64,
     pub last_updated_slot: i64,
     pub updated_at: DateTime<Utc>,
 }
