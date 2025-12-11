@@ -1,190 +1,98 @@
-use crate::models::helius_model::TransactionResult;
+use crate::models::helius_model::TransactionResult; // Ensure you have this model
+use crate::redis::redis_cleint::RedisClient;
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::Duration;
 
-pub async fn fetch_and_process_transaction(api_key: String, signature: String) -> Result<()> {
-    sleep(Duration::from_secs(2)).await;
+const REDIS_CHANNEL: &str = "solana:transactions";
 
-    println!("🔍 [Background] Fetching transaction: {}", signature);
+pub async fn run_worker() -> Result<()> {
+    let api_key = std::env::var("HELIUS_API_KEY").expect("HELIUS_API_KEY missing");
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
-    let rpc_url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
-    let client = reqwest::Client::new();
+    let redis = RedisClient::new(&redis_url).await?;
+    let http_client = reqwest::Client::new();
 
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTransaction",
-        "params": [
-            &signature, // Pass reference to avoid cloning
-            {
-                "encoding": "jsonParsed", // CRITICAL: Changed 'json' to 'jsonParsed' for easier reading
-                "maxSupportedTransactionVersion": 0
-            }
-        ]
-    });
+    println!("🎧 Worker started. Listening on: {}", REDIS_CHANNEL);
 
-    // STEP 2: The Retry Loop
-    let max_retries = 5;
-    let mut attempt = 0;
+    // 1. Subscribe to the channel
+    let mut stream = redis.subscribe(REDIS_CHANNEL).await?;
 
-    loop {
-        attempt += 1;
+    // 2. Reactive Loop: Code waits here until Redis sends a message
+    while let Some(payload) = stream.next().await {
+        println!("⚡ Event Received: {}", payload);
 
-        let response = client.post(&rpc_url).json(&request).send().await;
+        // Parse the mini-info (Signature) from Redis
+        if let Ok(info) = serde_json::from_str::<Value>(&payload) {
+            if let Some(signature) = info.get("signature").and_then(|s| s.as_str()) {
+                println!("🔍 Fetching details for: {}", signature);
 
-        match response {
-            Ok(resp) => {
-                // Handle Rate Limits (HTTP 429)
-                if resp.status() == 429 {
-                    if attempt >= max_retries {
-                        eprintln!("❌ [Give Up] Rate limited too many times: {}", signature);
-                        return Ok(());
-                    }
-                    eprintln!("⏳ Rate limited on attempt {}. Cooling down...", attempt);
-                    sleep(Duration::from_secs(attempt * 2)).await; // Exponential backoff
-                    continue;
-                }
-
-                // Parse the response body
-                let response_text = resp.text().await.context("Failed to get text")?;
-                let response_json: Value =
-                    serde_json::from_str(&response_text).context("Failed to parse JSON")?;
-
-                // Check for RPC Errors
-                if let Some(error) = response_json.get("error") {
-                    eprintln!("RPC Error for {}: {}", signature, error);
-                    return Ok(()); // Stop trying if it's a hard error
-                }
-
-                // Check for Result
-                if let Some(result) = response_json.get("result") {
-                    // CASE A: Transaction not found yet (null)
-                    if result.is_null() {
-                        if attempt >= max_retries {
-                            println!(
-                                "⚠️ Transaction {} never appeared after {} retries",
-                                signature, max_retries
-                            );
-                            return Ok(());
-                        }
-                        println!(
-                            "... Tx not found yet (Attempt {}/{}), waiting...",
-                            attempt, max_retries
-                        );
-                        sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
-
-                    // CASE B: Success! Parse and Process
-                    match serde_json::from_value::<TransactionResult>(result.clone()) {
-                        Ok(tx_result) => {
-                            println!("✅ [Background] Successfully parsed: {}", signature);
-                            process_transaction(tx_result).await?;
-                            return Ok(()); // Exit the loop and function
-                        }
-                        Err(e) => {
-                            eprintln!("❌ Failed to parse struct for {}: {}", signature, e);
-                            // Optional: Print raw json to debug structure mismatches
-                            // println!("Raw JSON: {}", result);
-                            return Ok(());
+                // Fetch full data from RPC
+                match fetch_full_transaction(&http_client, &api_key, signature).await {
+                    Ok(tx) => {
+                        // Save to Database
+                        if let Err(e) = save_to_database(tx).await {
+                            eprintln!("❌ DB Error: {}", e);
                         }
                     }
+                    Err(e) => eprintln!("❌ Fetch Error for {}: {}", signature, e),
                 }
             }
-            Err(e) => {
-                eprintln!("Network error on attempt {}: {}", attempt, e);
-                sleep(Duration::from_secs(1)).await;
-            }
-        }
-
-        if attempt >= max_retries {
-            break;
         }
     }
 
     Ok(())
 }
 
-// ---------------------------------------------------------
-// 2. The Processor (Logic & Display)
-// ---------------------------------------------------------
-async fn process_transaction(tx: TransactionResult) -> Result<()> {
-    println!("\n=== Transaction Details ===");
-    println!("Slot: {}", tx.slot);
-    // Handle Option<i64> safely for printing
-    if let Some(t) = tx.block_time {
-        println!("Block Time: {}", t);
-    }
+async fn fetch_full_transaction(
+    client: &reqwest::Client,
+    api_key: &str,
+    signature: &str,
+) -> Result<TransactionResult> {
+    // Basic Helius RPC call with retries
+    let rpc_url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [ signature, { "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0 } ]
+    });
 
-    // Safety check: Ensure signatures array is not empty
-    if let Some(sig) = tx.transaction.signatures.first() {
-        println!("Signature: {}", sig);
-    }
-
-    // Check if transaction succeeded
-    if let Some(meta) = &tx.meta {
-        if let Some(err) = &meta.err {
-            if !err.is_null() {
-                println!("Status: ❌ Failed");
-                return Ok(());
-            }
-        }
-        println!("Status: ✅ Success");
-        println!("Fee: {} lamports", meta.fee);
-
-        if let Some(compute) = meta.compute_units_consumed {
-            println!("Compute Units: {}", compute);
+    // Simple retry logic (3 attempts)
+    for attempt in 1..=3 {
+        let resp = client.post(&rpc_url).json(&request).send().await?;
+        if resp.status() == 429 {
+            tokio::time::sleep(Duration::from_secs(attempt)).await;
+            continue;
         }
 
-        // Print logs
-        if let Some(logs) = &meta.log_messages {
-            println!("\n📜 Logs (First 5):");
-            for log in logs.iter().take(5) {
-                println!("   {}", log);
+        let body: Value = resp.json().await?;
+        if let Some(result) = body.get("result") {
+            if !result.is_null() {
+                let tx: TransactionResult = serde_json::from_value(result.clone())?;
+                return Ok(tx);
             }
         }
 
-        // Token balances
-        if let Some(post_balances) = &meta.post_token_balances {
-            println!("\n💰 Token Balances Changes:");
-            for balance in post_balances {
-                println!(
-                    "   Mint: {} | Amount: {}",
-                    balance.mint,
-                    balance
-                        .ui_token_amount
-                        .ui_amount_string
-                        .clone()
-                        .unwrap_or_default()
-                );
-            }
-        }
+        // If result is null (not indexed yet), wait a bit and retry
+        tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
     }
 
-    // Print instructions
-    // Note: ensure your TransactionMessage struct has 'instructions' field
-    println!(
-        "\n📋 Instructions ({}):",
-        tx.transaction.message.instructions.len()
-    );
+    Err(anyhow::anyhow!("Transaction not found after retries"))
+}
 
-    for (i, ix) in tx.transaction.message.instructions.iter().enumerate() {
-        println!("   {}. Program: {}", i + 1, ix.program_id);
+async fn save_to_database(tx: TransactionResult) -> Result<()> {
+    let sig = tx
+        .transaction
+        .signatures
+        .first()
+        .cloned()
+        .unwrap_or_default();
 
-        // If it's a Pump.fun trade, the data is usually in 'data', not 'parsed'
-        // unless you have a specific parser for it.
-        if let Some(data) = &ix.data {
-            println!(
-                "      Raw Data: {}...",
-                &data.chars().take(20).collect::<String>()
-            );
-        }
-    }
+    // TODO: Write your Diesel / SQLx insert code here
+    println!("💾 [DB] Successfully saved transaction: {}", sig);
 
-    println!("=========================\n");
-
-    // TODO: DB Insert goes here
     Ok(())
 }

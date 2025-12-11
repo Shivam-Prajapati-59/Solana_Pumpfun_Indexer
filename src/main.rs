@@ -1,3 +1,5 @@
+use crate::redis::redis_cleint::{self, RedisClient};
+
 mod helius;
 mod models;
 mod redis;
@@ -11,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=============================================\n");
 
     // Run the WebSocket test
-    helius::ingester::run_websocket_test().await?;
+    helius::ingester::run_ingester().await?;
 
     Ok(())
 }

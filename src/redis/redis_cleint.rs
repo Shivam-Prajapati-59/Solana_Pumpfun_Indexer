@@ -1,46 +1,73 @@
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client, RedisResult};
-use serde_json::{self};
+use serde_json;
+use std::fmt;
 use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct RedisClient {
     pub connection: ConnectionManager,
+    client: Client,
+}
+
+impl fmt::Debug for RedisClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RedisClient")
+            .field("connection", &"ConnectionManager<Connected>")
+            .finish()
+    }
 }
 
 impl RedisClient {
     pub async fn new(redis_url: &str) -> Result<Self> {
         let client = Client::open(redis_url).context("Failed to create Redis client")?;
 
-        let connection = ConnectionManager::new(client)
+        let connection = ConnectionManager::new(client.clone())
             .await
             .context("Failed to establish Redis connection")?;
 
         info!("Successfully connected to Redis");
 
-        Ok(Self { connection })
+        Ok(Self { connection, client })
     }
 
     pub async fn publish<T: serde::Serialize>(&mut self, channel: &str, message: &T) -> Result<()> {
         let json = serde_json::to_string(message).context("Failed to serialize message")?;
 
-        match self
-            .connection
-            .publish::<_, _, ()>(channel, json.clone())
+        self.connection
+            .publish::<_, _, ()>(channel, json)
             .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                warn!("  Redis publish error: {}", e);
-
+            .map_err(|e| {
+                warn!("Redis publish error: {}", e);
                 if e.is_connection_dropped() || e.is_io_error() {
-                    warn!("  Redis connection lost, attempting reconnect...");
+                    warn!("Redis connection lost, attempting reconnect...");
                 }
+                anyhow::Error::from(e)
+            })?;
 
-                Err(e.into())
-            }
-        }
+        Ok(())
+    }
+
+    // --- NEW: Subscribe Method for the Worker ---
+    pub async fn subscribe(
+        &self,
+        channel: &str,
+    ) -> Result<impl futures_util::Stream<Item = String>> {
+        let mut pubsub_conn = self
+            .client
+            .get_async_pubsub()
+            .await
+            .context("Failed to get PubSub")?;
+        pubsub_conn.subscribe(channel).await?;
+
+        // Transform the stream to return just the payload string
+        let stream = pubsub_conn
+            .into_on_message()
+            .map(|msg| msg.get_payload::<String>().unwrap_or_default());
+
+        Ok(stream)
     }
 
     pub async fn set<T: serde::Serialize>(
@@ -99,8 +126,10 @@ impl RedisClient {
     }
 
     pub async fn ping(&mut self) -> Result<()> {
-        redis::cmd("PING")
-            .query_async::<String>(&mut self.connection)
+        // Simple ping test - set and get a test value
+        let _: () = self
+            .connection
+            .set("ping_test", "pong")
             .await
             .context("Redis PING failed")?;
         Ok(())
