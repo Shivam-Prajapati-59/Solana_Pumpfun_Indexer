@@ -91,6 +91,12 @@ async fn save_to_database(tx: TransactionResult) -> Result<()> {
         .cloned()
         .unwrap_or_default();
 
+    // println!("\n=== TRANSACTION DETAILS ===");
+    // println!("Signature: {}", sig);
+    // println!("\nFull Transaction Data:");
+    // println!("{:#?}", tx);
+    // println!("========================\n");
+
     // TODO: Write your Diesel / SQLx insert code here
     println!("💾 [DB] Successfully saved transaction: {}", sig);
 

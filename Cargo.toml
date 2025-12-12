@@ -3,6 +3,14 @@ name = "indexer"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "indexer"
+path = "src/main.rs"
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
+
 [dependencies]
 anyhow = "1.0.100"
 chrono = "0.4.42"
@@ -11,6 +19,7 @@ futures-util = "0.3.31"
 helius = "0.3.2"
 redis = { version = "0.32.7", features = ["tokio-comp", "connection-manager"] }
 reqwest = "0.12.25"
+rust_decimal = "1.39.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 solana-client = "3.1.4"
