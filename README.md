@@ -1,221 +1,206 @@
-# Pump.fun Indexer
+# 🚀 Pump.fun Indexer
 
-Real-time indexer for Pump.fun trades on Solana using Helius WebSocket API, Redis, and PostgreSQL/.
+A high-performance, real-time indexer for Pump.fun token trades on Solana.
 
-## Architecture
+## 📊 Architecture
 
 ```
-Helius WebSocket → Ingester → Redis → Worker → Parser → PostgreSQL
+┌─────────────────────┐
+│  Helius WebSocket   │  ← Real-time transaction stream
+│   (logsSubscribe)   │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│     Ingester        │  ← Filters Pump.fun transactions
+│  (src/main.rs)      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│   Redis Pub/Sub     │  ← Message queue
+│  (solana:txs)       │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│      Worker         │  ← Fetches full transaction data
+│ (src/bin/worker.rs) │     + Extracts metadata from logs
+└──────────┬──────────┘     + Parses trades & token info
+           │                + Calculates market metrics
+           ▼
+┌─────────────────────┐
+│  PostgreSQL + TSB   │  ← Stores trades, tokens, holders
+│  ┌─────────────┐    │
+│  │   tokens    │    │  ← Metadata, reserves, market cap
+│  ├─────────────┤    │
+│  │   trades    │    │  ← Buy/sell events (hypertable)
+│  ├─────────────┤    │
+│  │token_holders│    │  ← Wallet balances
+│  └─────────────┘    │
+└─────────────────────┘
+           │
+           ▼
+┌─────────────────────┐
+│   Pyth Network      │  ← Real-time SOL/USD price
+│  (Hermes API)       │     (30s cache)
+└─────────────────────┘
 ```
 
-- **Ingester**: Listens to Helius WebSocket for transaction signatures
-- **Redis**: Message queue for decoupling components
-- **Worker**: Fetches full transaction details via RPC
-- **Parser**: Extracts trade data from transactions
-- **Database**: Stores trades, tokens, and analytics
+## ✨ Features
 
-## Prerequisites
+- ✅ Real-time WebSocket event streaming
+- ✅ Complete metadata extraction (name, symbol, URI)
+- ✅ Bonding curve address detection
+- ✅ Live SOL/USD pricing via Pyth Network
+- ✅ Market cap & bonding curve progress tracking
+- ✅ Token holder balance updates
+- ✅ TimescaleDB hypertables for efficient queries
+- ✅ Auto-reconnection & error handling
 
-- Rust (latest stable)
-- PostgreSQL 14+ with extension
-- Redis
-- Helius API key
+## 📋 Prerequisites
 
-## Setup
+- **Rust** 1.70+
+- **PostgreSQL** 14+ with TimescaleDB
+- **Redis** 6+
+- **Helius API Key** ([Get one here](https://helius.dev))
+
+## 🛠️ Quick Start
 
 ### 1. Install Dependencies
 
 ```bash
-# PostgreSQL &
-# Ubuntu/Debian:
-sudo apt-get install postgresql postgresql-contrib
-sudo apt-get install -postgresql-14
+# Ubuntu/Debian
+sudo apt install postgresql postgresql-14-timescaledb redis-server
 
-# macOS:
-brew install postgresql
-
-# Redis
-# Ubuntu/Debian:
-sudo apt-get install redis-server
-
-# macOS:
-brew install redis
+# macOS
+brew install postgresql@14 timescaledb redis
 ```
 
-### 2. Configure Environment
-
-Copy the example environment file:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```env
-# Helius
-HELIUS_API_KEY=your-actual-helius-api-key
-
-# Redis
-REDIS_URL=redis://127.0.0.1:6379
-
-# PostgreSQL/
-DATABASE_URL=postgresql://username:password@localhost:5432/pump_indexer
-```
-
-### 3. Create Database
+### 2. Setup Database
 
 ```bash
 # Create database
 createdb pump_indexer
 
-# Or via psql:
-psql -U postgres -c "CREATE DATABASE pump_indexer;"
-
-# Enable  extension
-psql -U postgres -d pump_indexer -c "CREATE EXTENSION IF NOT EXISTS ;"
-```
-
-### 4. Run Migrations
-
-```bash
-# Install sqlx-cli
-cargo install sqlx-cli --no-default-features --features postgres,native-tls
+# Enable TimescaleDB
+psql pump_indexer -c "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;"
 
 # Run migrations
-sqlx migrate run
+psql pump_indexer -f migrations/20240101000000_init_schema.sql
 ```
 
-### 5. Start Services
-
-Make sure Redis and PostgreSQL are running:
+### 3. Configure Environment
 
 ```bash
-# Start Redis
-redis-server
-
-# Check PostgreSQL
-pg_ctl status
+cat > .env << EOF
+DATABASE_URL=postgresql://postgres:password@localhost/pump_indexer
+REDIS_URL=redis://127.0.0.1:6379
+HELIUS_API_KEY=your_helius_api_key_here
+EOF
 ```
 
-## Running the Indexer
-
-You need to run **two separate processes**:
-
-### Terminal 1: Ingester (WebSocket → Redis)
+### 4. Build & Run
 
 ```bash
-cargo run --bin indexer
+# Build release binaries
+cargo build --release
+
+# Terminal 1: Start Ingester
+cargo run --release
+
+# Terminal 2: Start Worker
+cargo run --release --bin worker
 ```
 
-This listens to Helius WebSocket and publishes transaction signatures to Redis.
-
-### Terminal 2: Worker (Redis → Database)
-
-```bash
-cargo run --bin worker
-```
-
-This subscribes to Redis, fetches full transactions, parses them, and saves to PostgreSQL.
-
-## Expected Output
-
-**Ingester Terminal:**
-
-```
-🚀 Starting Pump.fun Indexer - WebSocket Ingester
-===================================================
-
-📥 Detected: <signature>
-📡 Published to channel: solana:transactions
-```
-
-**Worker Terminal:**
-
-```
-🎧 Starting Pump.fun Indexer - Worker
-======================================
-
-✅ Database connected
-🎧 Worker started. Listening on: solana:transactions
-⚡ Event Received: {"signature":"...","err":null}
-🔍 Fetching details for: <signature>
-📊 Processing transaction: <signature>
-💰 Trade detected: BUY 1000000 tokens for 0.05 SOL
-✅ Trade saved to DB: <signature>
-```
-
-## Database Schema
+## 📊 Database Schema
 
 ### Tables
 
-- **tokens**: Token metadata (mint, symbol, bonding curve, reserves)
-- **trades**: All buy/sell transactions (hypertable for time-series)
-- **token_holders**: Current token balances per wallet
-- **transactions**: Audit log of all processed transactions
+| Table           | Description                          | Records    |
+| --------------- | ------------------------------------ | ---------- |
+| `tokens`        | Token metadata, reserves, market cap | Per token  |
+| `trades`        | All buy/sell transactions            | Per trade  |
+| `token_holders` | Real-time wallet balances            | Per holder |
 
-### Key Queries
+### Sample Queries
 
 ```sql
--- Recent trades for a token
-SELECT * FROM trades
-WHERE token_mint = '<mint_address>'
-ORDER BY timestamp DESC
-LIMIT 100;
+-- Top tokens by market cap
+SELECT mint_address, symbol, market_cap_usd, bonding_curve_progress
+FROM tokens
+ORDER BY market_cap_usd DESC
+LIMIT 10;
 
--- 24h volume
-SELECT SUM(sol_amount) as volume_24h
+-- Recent trades
+SELECT timestamp, is_buy, token_amount, sol_amount, price_usd
 FROM trades
-WHERE timestamp > NOW() - INTERVAL '24 hours';
+WHERE token_mint = 'YOUR_MINT'
+ORDER BY timestamp DESC
+LIMIT 20;
 
 -- Top holders
-SELECT * FROM token_holders
-WHERE token_mint = '<mint_address>'
+SELECT user_wallet, balance
+FROM token_holders
+WHERE token_mint = 'YOUR_MINT'
 ORDER BY balance DESC
-LIMIT 10;
+LIMIT 50;
+
+-- 24h volume
+SELECT SUM(sol_amount) / 1e9 as volume_sol
+FROM trades
+WHERE timestamp > NOW() - INTERVAL '24 hours';
 ```
 
-## Development
+## 🔍 What Gets Indexed
 
-### Building
+### Token Creation
 
-```bash
-# Check compilation
-cargo check
+- Mint address & creator wallet
+- Name, symbol, URI (from logs)
+- Bonding curve address (PDA detection)
+- Initial reserves & market cap
 
-# Build release
-cargo build --release
+### Every Trade
 
-# Run tests
-cargo test
+- Buy/sell detection
+- Token & SOL amounts
+- Real-time USD pricing
+- Virtual reserves snapshot
+- User wallet balance updates
+
+### Calculated Metrics
+
+- Market cap (USD)
+- Bonding curve progress (0-100%)
+- Price per token (SOL & USD)
+- Holder distribution
+
+## 📈 Monitoring
+
+The indexer outputs detailed logs:
+
+```
+🪙 New token created: EPjF...Dt1v
+✅ Token saved to DB (Market Cap: $1,234.56)
+💰 Trade detected: BUY 1000000 tokens for 0.5 SOL ($49.25)
+✅ Trade saved to DB
+✅ Token saved/updated (Market Cap: $1,350.00, Progress: 45.2%)
+✅ Token holder updated: ABC...xyz (balance: 1000000)
 ```
 
-## Troubleshooting
+## 🐛 Troubleshooting
 
-### "relation 'tokens' does not exist"
+**WebSocket disconnects:**
 
-Run migrations:
+- Auto-reconnects every 5 seconds
+- Check Helius API key validity
 
-```bash
-sqlx migrate run
-```
+**Missing trades:**
 
-### Worker can't connect to database
+- Ensure both ingester AND worker are running
+- Verify Redis connectivity: `redis-cli ping`
 
-Check your `DATABASE_URL` in `.env` and ensure PostgreSQL is running:
-
-```bash
-psql $DATABASE_URL -c "SELECT 1;"
-```
-
-### Ingester can't connect to WebSocket
-
-Verify your `HELIUS_API_KEY` is valid and has WebSocket access.
-
-### No events appearing
-
-Make sure both ingester AND worker are running in separate terminals.
-
-## License
+## 📄 License
 
 MIT
