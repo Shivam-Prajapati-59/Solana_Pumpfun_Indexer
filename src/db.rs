@@ -9,10 +9,6 @@ pub async fn get_db_pool() -> Result<PgPool> {
     let database_url = env::var("DATABASE_URL").context("DATABASE_URL must be set in .env")?;
 
     PgPoolOptions::new()
-        .max_connections(50)
-        .min_connections(5)
-        .acquire_timeout(Duration::from_secs(3))
-        .idle_timeout(Duration::from_secs(600))
         .connect(&database_url)
         .await
         .context("Failed to connect to Postgres")
