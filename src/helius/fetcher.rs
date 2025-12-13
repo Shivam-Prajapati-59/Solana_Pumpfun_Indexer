@@ -1,5 +1,7 @@
 use anyhow::Result;
 use futures_util::StreamExt;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -7,9 +9,11 @@ use tokio::sync::RwLock;
 use tokio::time::{Duration, Instant};
 
 use crate::db::get_db_pool;
-use crate::helius::parser::parse_pump_fun_transaction;
-use crate::models::helius_model::TransactionResult;
-use crate::models::queries::insert_trade;
+use crate::helius::parser::{parse_pump_fun_transaction, parse_token_creation};
+use crate::models::queries::{
+    get_token, get_token_holder, insert_trade, upsert_token, upsert_token_holder,
+};
+use crate::models::{Token, TokenHolder, helius_model::TransactionResult};
 use crate::redis::redis_cleint::RedisClient;
 
 const REDIS_CHANNEL: &str = "solana:transactions";
@@ -58,10 +62,10 @@ pub async fn run_worker() -> Result<()> {
                         if let Err(e) =
                             process_and_save(&db_pool, &http_client, &price_cache, tx).await
                         {
-                            eprintln!("❌ DB Error: {}", e);
+                            eprintln!("DB Error: {}", e);
                         }
                     }
-                    Err(e) => eprintln!("❌ Fetch Error for {}: {}", signature, e),
+                    Err(e) => eprintln!(" Fetch Error for {}: {}", signature, e),
                 }
             }
         }
@@ -187,19 +191,153 @@ async fn process_and_save(
     // Get real-time SOL price with caching
     let current_sol_price = get_sol_price(http_client, price_cache).await?;
 
-    // Parse the transaction
+    // 1. Check if this is a token creation event
+    if let Ok(Some(mut token)) = parse_token_creation(&tx) {
+        println!("🪙 New token created: {}", token.mint_address);
+
+        // Calculate initial market cap
+        if !token.virtual_token_reserves.is_zero() {
+            let token_price_sol = token.virtual_sol_reserves / token.virtual_token_reserves;
+            let sol_price_dec = Decimal::from_f64(current_sol_price).unwrap_or(Decimal::ZERO);
+            token.market_cap_usd = token_price_sol * token.token_total_supply * sol_price_dec;
+        }
+
+        upsert_token(pool, &token).await?;
+        println!(
+            "✅ Token saved to DB (Market Cap: ${:.2})",
+            token.market_cap_usd
+        );
+    }
+
+    // 2. Parse the transaction for trades
     match parse_pump_fun_transaction(&tx, current_sol_price) {
         Ok(Some(trade)) => {
             println!(
-                "💰 Trade detected: {} {} tokens for {} SOL",
+                "💰 Trade detected: {} {} tokens for {} SOL (${:.2})",
                 if trade.is_buy { "BUY" } else { "SELL" },
                 trade.token_amount,
-                trade.sol_amount
+                trade.sol_amount,
+                trade.price_usd.unwrap_or(Decimal::ZERO)
             );
 
-            // Insert into database
+            // Insert the trade
             insert_trade(pool, &trade).await?;
             println!("✅ Trade saved to DB: {}", sig);
+
+            // 3. Update token with latest reserves and market cap (or create if not exists)
+            let mut token = match get_token(pool, &trade.token_mint).await {
+                Ok(Some(t)) => t,
+                _ => {
+                    // Token doesn't exist, try to extract metadata from this transaction
+                    let (name, symbol, uri) = extract_token_metadata_from_tx(&tx);
+                    let bonding_curve = find_bonding_curve_from_tx(&tx, &trade.token_mint);
+
+                    Token {
+                        mint_address: trade.token_mint.clone(),
+                        name,
+                        symbol,
+                        uri,
+                        bonding_curve_address: bonding_curve,
+                        creator_wallet: Some(trade.user_wallet.clone()),
+                        virtual_token_reserves: trade.virtual_token_reserves,
+                        virtual_sol_reserves: trade.virtual_sol_reserves,
+                        real_token_reserves: Decimal::ZERO,
+                        token_total_supply: Decimal::from_u64(1_000_000_000_000_000)
+                            .unwrap_or(Decimal::ZERO), // 1B tokens standard
+                        market_cap_usd: Decimal::ZERO,
+                        bonding_curve_progress: Decimal::ZERO,
+                        complete: false,
+                        created_at: trade.timestamp,
+                        updated_at: None,
+                    }
+                }
+            };
+
+            // If token metadata is missing, try to extract from current transaction
+            if token.name.is_none() || token.symbol.is_none() || token.uri.is_none() {
+                let (name, symbol, uri) = extract_token_metadata_from_tx(&tx);
+                if token.name.is_none() && name.is_some() {
+                    token.name = name;
+                }
+                if token.symbol.is_none() && symbol.is_some() {
+                    token.symbol = symbol;
+                }
+                if token.uri.is_none() && uri.is_some() {
+                    token.uri = uri;
+                }
+            }
+
+            // If bonding curve is missing, try to find it
+            if token.bonding_curve_address.is_none() {
+                token.bonding_curve_address = find_bonding_curve_from_tx(&tx, &trade.token_mint);
+            }
+
+            // Update reserves from trade
+            token.virtual_sol_reserves = trade.virtual_sol_reserves;
+            token.virtual_token_reserves = trade.virtual_token_reserves;
+
+            // Calculate market cap: (price_per_token) * total_supply
+            if !trade.virtual_token_reserves.is_zero() {
+                let token_price_sol = trade.virtual_sol_reserves / trade.virtual_token_reserves;
+                let sol_price_dec = Decimal::from_f64(current_sol_price).unwrap_or(Decimal::ZERO);
+                token.market_cap_usd = token_price_sol * token.token_total_supply * sol_price_dec;
+
+                // Calculate bonding curve progress (typically completes at 85 SOL)
+                let bonding_complete_sol =
+                    Decimal::from_u64(85_000_000_000).unwrap_or(Decimal::ZERO); // 85 SOL in lamports
+                token.bonding_curve_progress =
+                    (trade.virtual_sol_reserves / bonding_complete_sol) * Decimal::from(100);
+                if token.bonding_curve_progress >= Decimal::from(100) {
+                    token.complete = true;
+                }
+            }
+
+            upsert_token(pool, &token).await?;
+            println!(
+                "✅ Token saved/updated (Market Cap: ${:.2}, Progress: {:.1}%)",
+                token.market_cap_usd, token.bonding_curve_progress
+            );
+
+            // 4. Update token holder balance
+            // Get current balance if exists
+            let current_balance = if let Ok(Some(holder)) =
+                get_token_holder(pool, &trade.token_mint, &trade.user_wallet).await
+            {
+                holder.balance
+            } else {
+                Decimal::ZERO
+            };
+
+            // Calculate new balance
+            let new_balance = if trade.is_buy {
+                current_balance + trade.token_amount
+            } else {
+                // For sells, ensure we don't go negative
+                if current_balance >= trade.token_amount {
+                    current_balance - trade.token_amount
+                } else {
+                    Decimal::ZERO
+                }
+            };
+
+            // Update holder only if balance > 0 or it's a buy
+            if new_balance > Decimal::ZERO || trade.is_buy {
+                let holder = TokenHolder {
+                    token_mint: trade.token_mint.clone(),
+                    user_wallet: trade.user_wallet.clone(),
+                    balance: new_balance,
+                    last_updated_slot: trade.slot,
+                    updated_at: None,
+                };
+
+                upsert_token_holder(pool, &holder).await?;
+                println!(
+                    "✅ Token holder updated: {} (balance: {})",
+                    trade.user_wallet, new_balance
+                );
+            } else {
+                println!("ℹ️  Holder {} sold all tokens", trade.user_wallet);
+            }
         }
         Ok(None) => {
             println!("ℹ️  No trade data found in transaction");
@@ -210,4 +348,129 @@ async fn process_and_save(
     }
 
     Ok(())
+}
+
+/// Extract token metadata from transaction logs
+fn extract_token_metadata_from_tx(
+    tx: &TransactionResult,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if let Some(meta) = &tx.meta {
+        if let Some(logs) = &meta.log_messages {
+            let mut name = None;
+            let mut symbol = None;
+            let mut uri = None;
+
+            for log in logs {
+                // Extract name
+                if name.is_none() && (log.contains("name:") || log.contains("Name:")) {
+                    if let Some(pos) = log.find("name:").or_else(|| log.find("Name:")) {
+                        let start = pos + 5;
+                        let value = log[start..]
+                            .trim()
+                            .split(&[',', '"', '}'][..])
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if !value.is_empty() && value.len() < 100 {
+                            name = Some(value.to_string());
+                        }
+                    }
+                }
+
+                // Extract symbol
+                if symbol.is_none() && (log.contains("symbol:") || log.contains("Symbol:")) {
+                    if let Some(pos) = log.find("symbol:").or_else(|| log.find("Symbol:")) {
+                        let start = pos + 7;
+                        let value = log[start..]
+                            .trim()
+                            .split(&[',', '"', '}'][..])
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if !value.is_empty() && value.len() < 20 {
+                            symbol = Some(value.to_string());
+                        }
+                    }
+                }
+
+                // Extract URI
+                if uri.is_none()
+                    && (log.contains("uri:") || log.contains("Uri:") || log.contains("metadata:"))
+                {
+                    if let Some(pos) = log
+                        .find("uri:")
+                        .or_else(|| log.find("Uri:"))
+                        .or_else(|| log.find("metadata:"))
+                    {
+                        let start = pos
+                            + if log[pos..].starts_with("metadata:") {
+                                9
+                            } else {
+                                4
+                            };
+                        let value = log[start..]
+                            .trim()
+                            .split(&[' ', ',', '"', '}'][..])
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if value.starts_with("http")
+                            || value.starts_with("ipfs")
+                            || value.starts_with("ar://")
+                        {
+                            uri = Some(value.to_string());
+                        }
+                    }
+                }
+            }
+
+            return (name, symbol, uri);
+        }
+    }
+    (None, None, None)
+}
+
+/// Find bonding curve address from transaction accounts
+/// Pump.fun bonding curve characteristics:
+/// - Writable PDA at specific position (typically 4-6)
+/// - Holds SOL balance for the curve
+/// - Not a signer or known program
+fn find_bonding_curve_from_tx(tx: &TransactionResult, mint_address: &str) -> Option<String> {
+    const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+    const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+    const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
+    const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+    const RENT_PROGRAM: &str = "SysvarRent111111111111111111111111111111111";
+    const EVENT_AUTHORITY: &str = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1";
+
+    let mut candidates = Vec::new();
+
+    for (idx, account) in tx.transaction.message.account_keys.iter().enumerate() {
+        // Must be writable and not a signer
+        if !account.writable || account.signer {
+            continue;
+        }
+
+        // Skip known addresses
+        if account.pubkey == mint_address
+            || account.pubkey == SYSTEM_PROGRAM
+            || account.pubkey == TOKEN_PROGRAM
+            || account.pubkey == ASSOCIATED_TOKEN_PROGRAM
+            || account.pubkey == RENT_PROGRAM
+            || account.pubkey == EVENT_AUTHORITY
+            || account.pubkey == SOL_MINT
+            || account.pubkey == PUMP_FUN_PROGRAM_ID
+        {
+            continue;
+        }
+
+        // Bonding curve typically at position 4-6
+        if idx >= 3 && idx <= 7 && account.pubkey.len() == 44 {
+            candidates.push((idx, account.pubkey.clone()));
+        }
+    }
+
+    // Return first valid candidate
+    candidates.first().map(|(_, addr)| addr.clone())
 }

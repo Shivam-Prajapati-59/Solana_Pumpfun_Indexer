@@ -101,7 +101,7 @@ impl WebSocketClient {
                         if let Err(e) = self.redis_client.publish(REDIS_CHANNEL, &tx_info).await {
                             eprintln!("❌ Publish failed: {}", e);
                         } else {
-                            println!("📡 Published to channel: {}", REDIS_CHANNEL);
+                            println!("Published to channel: {}", REDIS_CHANNEL);
                         }
                     }
                 }

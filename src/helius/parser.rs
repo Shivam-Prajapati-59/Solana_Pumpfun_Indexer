@@ -188,6 +188,203 @@ fn find_bonding_curve_reserves(
     (0, 0)
 }
 
-pub fn parse_token_creation(_tx: &TransactionResult) -> Result<Option<Token>> {
+/// Parse token creation from pump.fun
+pub fn parse_token_creation(tx: &TransactionResult) -> Result<Option<Token>> {
+    // Check if this is a pump.fun program interaction
+    let is_pump_fun = tx
+        .transaction
+        .message
+        .instructions
+        .iter()
+        .any(|ix| ix.program_id == PUMP_FUN_PROGRAM_ID);
+
+    if !is_pump_fun {
+        return Ok(None);
+    }
+
+    // Look for token mint creation in post_token_balances
+    if let Some(meta) = &tx.meta {
+        let empty_vec = vec![];
+        let post_balances = meta.post_token_balances.as_ref().unwrap_or(&empty_vec);
+
+        // Find new token mints (accounts that appear in post but not pre)
+        let pre_balances = meta.pre_token_balances.as_ref().unwrap_or(&empty_vec);
+
+        for post in post_balances {
+            // Check if this is a new token (not in pre_balances)
+            let is_new = !pre_balances.iter().any(|p| p.mint == post.mint);
+
+            if is_new && post.mint != SOL_MINT {
+                let mint_address = post.mint.clone();
+                let creator_wallet = tx
+                    .transaction
+                    .message
+                    .account_keys
+                    .iter()
+                    .find(|k| k.signer)
+                    .map(|k| k.pubkey.clone())
+                    .unwrap_or_default();
+
+                // Extract metadata from logs
+                let (name, symbol, uri) = extract_metadata_from_logs(meta);
+
+                // Find bonding curve address (typically one of the writable accounts)
+                let bonding_curve_address =
+                    find_bonding_curve_address(&tx.transaction.message.account_keys, &mint_address);
+
+                // Find bonding curve reserves
+                let (real_sol_reserves, real_token_reserves) = find_bonding_curve_reserves(
+                    meta,
+                    &mint_address,
+                    -1, // Not user account
+                    &tx.transaction.message.account_keys,
+                );
+
+                let virtual_sol = real_sol_reserves + VIRTUAL_SOL_OFFSET;
+                let virtual_token = real_token_reserves;
+
+                return Ok(Some(Token {
+                    mint_address,
+                    name,
+                    symbol,
+                    uri,
+                    bonding_curve_address,
+                    creator_wallet: Some(creator_wallet),
+                    virtual_token_reserves: Decimal::from_u64(virtual_token)
+                        .unwrap_or(Decimal::ZERO),
+                    virtual_sol_reserves: Decimal::from_u64(virtual_sol).unwrap_or(Decimal::ZERO),
+                    real_token_reserves: Decimal::from_u64(real_token_reserves)
+                        .unwrap_or(Decimal::ZERO),
+                    token_total_supply: Decimal::from_u64(1_000_000_000_000_000)
+                        .unwrap_or(Decimal::ZERO), // Standard pump.fun supply
+                    market_cap_usd: Decimal::ZERO,
+                    bonding_curve_progress: Decimal::ZERO,
+                    complete: false,
+                    created_at: chrono::Utc::now(),
+                    updated_at: None,
+                }));
+            }
+        }
+    }
+
     Ok(None)
+}
+
+/// Extract token metadata (name, symbol, uri) from transaction logs
+fn extract_metadata_from_logs(
+    meta: &crate::models::helius_model::TransactionMeta,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if let Some(logs) = &meta.log_messages {
+        let mut name = None;
+        let mut symbol = None;
+        let mut uri = None;
+
+        for log in logs {
+            // Look for metadata in logs - Pump.fun often logs this info
+            // Format examples:
+            // "name: TokenName"
+            // "symbol: TKN"
+            // "uri: https://..."
+
+            if log.contains("name:") || log.contains("Name:") {
+                if let Some(pos) = log.find("name:").or_else(|| log.find("Name:")) {
+                    let start = pos + 5;
+                    let value = log[start..].trim().split(',').next().unwrap_or("").trim();
+                    if !value.is_empty() && value.len() < 100 {
+                        name = Some(value.to_string());
+                    }
+                }
+            }
+
+            if log.contains("symbol:") || log.contains("Symbol:") {
+                if let Some(pos) = log.find("symbol:").or_else(|| log.find("Symbol:")) {
+                    let start = pos + 7;
+                    let value = log[start..].trim().split(',').next().unwrap_or("").trim();
+                    if !value.is_empty() && value.len() < 20 {
+                        symbol = Some(value.to_string());
+                    }
+                }
+            }
+
+            if log.contains("uri:") || log.contains("Uri:") || log.contains("metadata:") {
+                if let Some(pos) = log
+                    .find("uri:")
+                    .or_else(|| log.find("Uri:"))
+                    .or_else(|| log.find("metadata:"))
+                {
+                    let start = pos
+                        + if log[pos..].starts_with("metadata:") {
+                            9
+                        } else {
+                            4
+                        };
+                    let value = log[start..]
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    if value.starts_with("http")
+                        || value.starts_with("ipfs")
+                        || value.starts_with("ar://")
+                    {
+                        uri = Some(value.to_string());
+                    }
+                }
+            }
+        }
+
+        return (name, symbol, uri);
+    }
+
+    (None, None, None)
+}
+
+/// Find bonding curve address from account keys
+/// Pump.fun bonding curve is typically:
+/// - A writable PDA (Program Derived Address)
+/// - Position 4 or 5 in the accounts array for trades
+/// - Contains SOL balance (from pre/post balances)
+fn find_bonding_curve_address(
+    account_keys: &[crate::models::helius_model::AccountKey],
+    mint_address: &str,
+) -> Option<String> {
+    // Known program addresses to exclude
+    const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
+    const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+    const RENT_PROGRAM: &str = "SysvarRent111111111111111111111111111111111";
+    const EVENT_AUTHORITY: &str = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1";
+
+    // Collect potential bonding curve candidates
+    let mut candidates = Vec::new();
+
+    for (idx, account) in account_keys.iter().enumerate() {
+        // Bonding curve must be writable and not a signer
+        if !account.writable || account.signer {
+            continue;
+        }
+
+        // Skip known program addresses
+        if account.pubkey == mint_address
+            || account.pubkey == SYSTEM_PROGRAM
+            || account.pubkey == TOKEN_PROGRAM
+            || account.pubkey == ASSOCIATED_TOKEN_PROGRAM
+            || account.pubkey == RENT_PROGRAM
+            || account.pubkey == EVENT_AUTHORITY
+            || account.pubkey == SOL_MINT
+            || account.pubkey == PUMP_FUN_PROGRAM_ID
+        {
+            continue;
+        }
+
+        // Bonding curve is typically at position 4-6 in Pump.fun transactions
+        // and is a base58 address (44 chars for standard Solana addresses)
+        if idx >= 3 && idx <= 7 && account.pubkey.len() == 44 {
+            candidates.push((idx, account.pubkey.clone()));
+        }
+    }
+
+    // Return the first valid candidate (typically position 4 or 5)
+    candidates.first().map(|(_, addr)| addr.clone())
 }

@@ -258,6 +258,33 @@ pub async fn get_top_holders(
     Ok(holders)
 }
 
+/// Get a specific token holder
+pub async fn get_token_holder(
+    pool: &PgPool,
+    mint_address: &str,
+    wallet: &str,
+) -> Result<Option<TokenHolder>> {
+    let holder = sqlx::query_as::<_, TokenHolder>(
+        r#"
+        SELECT 
+            token_mint,
+            user_wallet,
+            balance,
+            last_updated_slot,
+            updated_at
+        FROM token_holders 
+        WHERE token_mint = $1 AND user_wallet = $2
+        "#,
+    )
+    .bind(mint_address)
+    .bind(wallet)
+    .fetch_optional(pool)
+    .await
+    .context("Failed to fetch token holder")?;
+
+    Ok(holder)
+}
+
 // ==========================================
 // TRANSACTION OPERATIONS (Audit Log)
 // ==========================================
